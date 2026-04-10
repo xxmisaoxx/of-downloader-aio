@@ -145,20 +145,33 @@
     const MAX_STALE = 8;
 
     window.scrollTo(0, 0);
-    await sleep(1500);
+    await sleep(2000);
 
     while (!isCancelled) {
       const prevH = el.scrollHeight;
+
+      // Scroll in steps to trigger lazy-loading more reliably
+      const step = Math.floor(window.innerHeight * 0.8);
+      const target = el.scrollHeight;
+      for (let pos = el.scrollTop + step; pos <= target; pos += step) {
+        window.scrollTo(0, pos);
+        await sleep(300);
+      }
       window.scrollTo(0, el.scrollHeight);
-      await sleep(1800);
+      await sleep(2000); // wait for API responses
 
       const curCount = collectedMediaItems.length + collectedPosts.length;
       const newH = el.scrollHeight;
 
+      const statusParts = [];
+      if (collectedMediaItems.length) statusParts.push(`${collectedMediaItems.length} media items`);
+      if (collectedPosts.length) statusParts.push(`${collectedPosts.length} posts`);
+      updateStatus(`Scrolling... ${statusParts.join(' + ') || '0 items'} captured`);
+
       if (curCount === lastCount) {
         staleRounds++;
-        if (staleRounds >= MAX_STALE || (newH === prevH && staleRounds >= 3)) {
-          console.log('[OF DL] Scroll complete — no new data');
+        if (staleRounds >= MAX_STALE || (newH === prevH && staleRounds >= 4)) {
+          console.log(`[OF DL] Scroll complete — no new data after ${staleRounds} rounds`);
           break;
         }
       } else {
@@ -181,49 +194,93 @@
     return fallback;
   }
 
+  function findMediaUrl(media) {
+    // Photo URLs
+    if (media.type === 'photo' || media.type === 'image') {
+      return media.full || media.src || media.preview || media.squarePreview || media.thumb || null;
+    }
+    // Video / gif URLs
+    if (media.type === 'video' || media.type === 'gif') {
+      return (
+        media.source?.source ||
+        media.source?.url ||
+        media.files?.source?.url ||
+        media.files?.preview?.url ||
+        (media.videoSources && (
+          media.videoSources['720']?.url ||
+          media.videoSources['480']?.url ||
+          media.videoSources['240']?.url
+        )) ||
+        media.full || media.src || media.preview || null
+      );
+    }
+    // Unknown type — try common URL fields anyway
+    return media.full || media.src || media.source?.source || media.source?.url || media.preview || null;
+  }
+
   function extractDownloadable(media, seen, results) {
-    const id = String(media.id);
-    if (!id || seen.has(id)) return;
+    const id = String(media.id || '');
+    if (!id || id === 'undefined' || id === 'null' || seen.has(id)) return;
     seen.add(id);
 
-    if (media.type === 'photo') {
-      const url = media.full || media.src || media.preview || null;
-      if (url) {
-        results.push({ id, url, type: 'photo', filename: `${id}.${getExtension(url, 'jpg')}` });
-      }
-    } else if (media.type === 'video' || media.type === 'gif') {
-      const url =
-        media.source?.source ||
-        media.files?.source?.url ||
-        (media.videoSources && (media.videoSources['720']?.url || media.videoSources['240']?.url)) ||
-        media.full || media.src || null;
-      if (url) {
-        results.push({ id, url, type: 'video', filename: `${id}.${getExtension(url, 'mp4')}` });
-      }
+    const url = findMediaUrl(media);
+    if (!url) {
+      console.warn(`[OF DL] No URL found for media ${id} (type=${media.type}). Keys:`, Object.keys(media));
+      return;
     }
+
+    const isVideo = media.type === 'video' || media.type === 'gif';
+    const ext = getExtension(url, isVideo ? 'mp4' : 'jpg');
+    results.push({ id, url, type: isVideo ? 'video' : 'photo', filename: `${id}.${ext}` });
   }
 
   function extractAll() {
     const results = [];
     const seen = new Set();
 
-    // Direct media items from /medias endpoint
-    for (const item of collectedMediaItems) {
-      // Could be a media object directly or a post-like wrapper
-      if (item.media && Array.isArray(item.media)) {
-        for (const m of item.media) extractDownloadable(m, seen, results);
-      } else {
-        extractDownloadable(item, seen, results);
+    // Log raw structure for debugging
+    if (collectedMediaItems.length > 0) {
+      const sample = collectedMediaItems[0];
+      console.log('[OF DL] Sample media item keys:', Object.keys(sample));
+      console.log('[OF DL] Sample media item:', JSON.stringify(sample).slice(0, 500));
+      if (sample.media) console.log('[OF DL] Has .media array, length:', sample.media?.length);
+    }
+    if (collectedPosts.length > 0) {
+      const sample = collectedPosts[0];
+      console.log('[OF DL] Sample post keys:', Object.keys(sample));
+      if (sample.media?.[0]) {
+        console.log('[OF DL] Sample post.media[0] keys:', Object.keys(sample.media[0]));
+        console.log('[OF DL] Sample post.media[0]:', JSON.stringify(sample.media[0]).slice(0, 500));
       }
     }
 
-    // Posts from /posts endpoint (each post has .media array)
+    // Direct media items from /medias endpoint
+    // OF returns these as post-like objects that contain a .media array
+    for (const item of collectedMediaItems) {
+      if (item.media && Array.isArray(item.media)) {
+        for (const m of item.media) extractDownloadable(m, seen, results);
+      } else if (item.type) {
+        // Direct media object
+        extractDownloadable(item, seen, results);
+      } else {
+        // Unknown structure — try to find media in any array property
+        for (const key of Object.keys(item)) {
+          const val = item[key];
+          if (Array.isArray(val) && val.length > 0 && val[0]?.id) {
+            for (const m of val) extractDownloadable(m, seen, results);
+          }
+        }
+      }
+    }
+
+    // Posts from /posts endpoint
     for (const post of collectedPosts) {
       if (post.media && Array.isArray(post.media)) {
         for (const m of post.media) extractDownloadable(m, seen, results);
       }
     }
 
+    console.log(`[OF DL] Extracted ${results.length} downloadable items from ${collectedMediaItems.length} media items + ${collectedPosts.length} posts`);
     return results;
   }
 
@@ -266,7 +323,7 @@
       stats.total = mediaList.length;
 
       if (mediaList.length === 0) {
-        finish(`Captured ${rawCount} items but found no downloadable URLs.`);
+        finish(`Captured ${rawCount} items but found no downloadable URLs. Check browser console (F12) for diagnostic info.`);
         return;
       }
 
