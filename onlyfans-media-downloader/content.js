@@ -1,4 +1,7 @@
 // content.js - UI injection, API pagination, media extraction, download orchestration
+// Uses a page-context bridge (injected.js) for API calls so that OnlyFans'
+// dynamic request interceptors (which compute per-request `sign` headers) are
+// invoked automatically.
 
 (() => {
   'use strict';
@@ -10,18 +13,86 @@
   let currentCreator = null;
   let stats = { total: 0, downloaded: 0, skipped: 0, failed: 0 };
   let uiInjected = false;
+  let bridgeReady = false;
+  let pendingRequests = new Map(); // id -> { resolve, reject }
+  let requestIdCounter = 0;
+
+  // ── Page-Context Bridge ─────────────────────────────────────────────────────
+
+  const CHANNEL = 'of-dl';
+
+  function injectPageScript() {
+    const script = document.createElement('script');
+    script.src = chrome.runtime.getURL('injected.js');
+    script.onload = () => script.remove();
+    (document.head || document.documentElement).appendChild(script);
+  }
+
+  window.addEventListener('message', (event) => {
+    if (event.source !== window) return;
+    if (event.data?.channel !== CHANNEL || event.data?.direction !== 'to-content') return;
+
+    const { id, type, payload } = event.data;
+
+    if (type === 'BRIDGE_READY') {
+      bridgeReady = true;
+      console.log('[OF Downloader] Page-context bridge ready');
+      return;
+    }
+
+    // Match pending API request
+    const pending = pendingRequests.get(id);
+    if (!pending) return;
+
+    if (type === 'API_FETCH_SUCCESS') {
+      pendingRequests.delete(id);
+      pending.resolve(payload);
+    } else if (type === 'API_FETCH_ERROR') {
+      pendingRequests.delete(id);
+      pending.reject(new Error(`API error ${payload.status}: ${payload.statusText}`));
+    }
+  });
+
+  function apiFetchViaBridge(url) {
+    return new Promise((resolve, reject) => {
+      if (!bridgeReady) {
+        reject(new Error('Page bridge not ready. Please reload the page and try again.'));
+        return;
+      }
+
+      const id = String(++requestIdCounter);
+      pendingRequests.set(id, { resolve, reject });
+
+      window.postMessage({
+        channel: CHANNEL,
+        direction: 'to-page',
+        id,
+        type: 'API_FETCH',
+        payload: { url },
+      }, '*');
+
+      // Timeout after 30 seconds
+      setTimeout(() => {
+        if (pendingRequests.has(id)) {
+          pendingRequests.delete(id);
+          reject(new Error('API request timed out'));
+        }
+      }, 30000);
+    });
+  }
 
   // ── Utility ─────────────────────────────────────────────────────────────────
 
   function getCreatorFromURL() {
     const path = window.location.pathname;
-    // Match /username but not /settings, /my/..., /chats, etc.
     const systemPaths = [
       'my', 'settings', 'chats', 'notifications', 'bookmarks',
       'subscriptions', 'explore', 'home', 'new', 'search',
+      'login', 'signup', 'api', 'api2', 'terms', 'privacy',
+      'dmca', 'compliance', 'refund', 'developers', 'about',
     ];
     const match = path.match(/^\/([a-zA-Z0-9._-]+)\/?$/);
-    if (match && !systemPaths.includes(match[1])) {
+    if (match && !systemPaths.includes(match[1].toLowerCase())) {
       return match[1];
     }
     return null;
@@ -47,63 +118,40 @@
     });
   }
 
-  // ── Auth Headers ────────────────────────────────────────────────────────────
+  // ── OF API Calls (via page bridge) ─────────────────────────────────────────
 
-  async function getAuthHeaders() {
-    const response = await sendMessage({ type: 'GET_AUTH_HEADERS' });
-    if (!response?.headers || !response.headers['user-id']) {
-      throw new Error(
-        'Auth headers not captured yet. Browse around OnlyFans a bit so the extension can capture your session headers, then try again.'
-      );
-    }
-    return response.headers;
-  }
-
-  // ── OF API Calls ────────────────────────────────────────────────────────────
-
-  async function apiFetch(endpoint, headers) {
-    const url = `https://onlyfans.com/api2/v2${endpoint}`;
-    const resp = await fetch(url, {
-      method: 'GET',
-      headers: {
-        accept: 'application/json, text/plain, */*',
-        'app-token': headers['app-token'] || '',
-        sign: headers['sign'] || '',
-        time: headers['time'] || '',
-        'user-id': headers['user-id'] || '',
-        'x-bc': headers['x-bc'] || '',
-        'user-agent': headers['user-agent'] || navigator.userAgent,
-      },
-      credentials: 'include',
-    });
-
-    if (!resp.ok) {
-      throw new Error(`API error ${resp.status}: ${resp.statusText}`);
-    }
-
-    return resp.json();
-  }
-
-  async function resolveUserId(username, headers) {
-    const data = await apiFetch(`/users/${username}`, headers);
+  async function resolveUserId(username) {
+    const url = `https://onlyfans.com/api2/v2/users/${encodeURIComponent(username)}`;
+    const data = await apiFetchViaBridge(url);
     if (!data?.id) {
-      throw new Error(`Could not resolve user ID for "${username}"`);
+      throw new Error(`Could not resolve user ID for "${username}". Make sure you're subscribed to this creator.`);
     }
     return data.id;
   }
 
-  async function fetchAllPosts(userId, headers) {
+  async function fetchAllPosts(userId) {
     const allPosts = [];
     let beforePublishTime = '';
     let hasMore = true;
+    let page = 0;
 
     while (hasMore && !isCancelled) {
-      let endpoint = `/users/${userId}/posts?limit=50&order=publish_date_desc&skip_users=all&format=infinite`;
+      let endpoint = `https://onlyfans.com/api2/v2/users/${userId}/posts?limit=50&order=publish_date_desc&skip_users=all&format=infinite`;
       if (beforePublishTime) {
         endpoint += `&beforePublishTime=${beforePublishTime}`;
       }
 
-      const data = await apiFetch(endpoint, headers);
+      let data;
+      try {
+        data = await apiFetchViaBridge(endpoint);
+      } catch (err) {
+        // If we get an error after already collecting some posts, just stop
+        if (allPosts.length > 0) {
+          console.warn('[OF Downloader] Pagination error, stopping:', err.message);
+          break;
+        }
+        throw err;
+      }
 
       if (!data || !Array.isArray(data.list) || data.list.length === 0) {
         hasMore = false;
@@ -111,9 +159,10 @@
       }
 
       allPosts.push(...data.list);
-      updateStatus(`Scanning posts... found ${allPosts.length} so far`);
+      page++;
+      updateStatus(`Scanning posts... found ${allPosts.length} so far (page ${page})`);
 
-      // Use the last post's publishedAt as cursor
+      // Use the last post's timestamp as cursor
       const lastPost = data.list[data.list.length - 1];
       if (lastPost?.postedAtPrecise) {
         beforePublishTime = lastPost.postedAtPrecise;
@@ -138,16 +187,22 @@
 
   function extractMedia(posts) {
     const mediaItems = [];
+    const seenIds = new Set();
 
     for (const post of posts) {
       if (!post.media || !Array.isArray(post.media)) continue;
 
       for (const media of post.media) {
+        // Deduplicate by media ID
+        const mediaId = String(media.id);
+        if (seenIds.has(mediaId)) continue;
+        seenIds.add(mediaId);
+
         if (media.type === 'photo' && media.full) {
           const url = media.full;
           const ext = getExtension(url, 'jpg');
           mediaItems.push({
-            id: String(media.id),
+            id: mediaId,
             url: url,
             type: 'photo',
             filename: `${media.id}.${ext}`,
@@ -164,7 +219,7 @@
           if (url) {
             const ext = getExtension(url, 'mp4');
             mediaItems.push({
-              id: String(media.id),
+              id: mediaId,
               url: url,
               type: 'video',
               filename: `${media.id}.${ext}`,
@@ -206,16 +261,18 @@
 
     setButtonState('running');
     updateProgress(0);
-    updateStatus('Fetching auth headers...');
+    updateStatus('Connecting to OnlyFans API...');
 
     try {
-      const headers = await getAuthHeaders();
+      if (!bridgeReady) {
+        throw new Error('Page bridge not ready. Please reload the page and try again.');
+      }
 
       updateStatus(`Resolving user ID for ${creator}...`);
-      const userId = await resolveUserId(creator, headers);
+      const userId = await resolveUserId(creator);
 
       updateStatus('Scanning posts...');
-      const posts = await fetchAllPosts(userId, headers);
+      const posts = await fetchAllPosts(userId);
 
       if (isCancelled) {
         finish('Cancelled');
@@ -262,14 +319,18 @@
         const filename = `OnlyFans/${safeName}/${media.filename}`;
 
         try {
-          await sendMessage({
+          const result = await sendMessage({
             type: 'DOWNLOAD_MEDIA',
             url: media.url,
             filename: filename,
             mediaId: media.id,
             creator: creator,
           });
-          stats.downloaded++;
+          if (result?.success) {
+            stats.downloaded++;
+          } else {
+            stats.failed++;
+          }
         } catch (err) {
           console.error(`[OF Downloader] Failed to download ${media.id}:`, err);
           stats.failed++;
@@ -425,6 +486,11 @@
 
   observer.observe(document.body, { childList: true, subtree: true });
 
-  // Initial check
+  // ── Init ────────────────────────────────────────────────────────────────────
+
+  // Inject the page-context bridge script
+  injectPageScript();
+
+  // Initial page check
   checkPage();
 })();

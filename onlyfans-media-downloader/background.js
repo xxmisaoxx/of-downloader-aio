@@ -1,31 +1,7 @@
-// background.js - Service worker for auth header capture and download management
-
-// ── Auth Header Capture ─────────────────────────────────────────────────────
-
-const AUTH_HEADER_NAMES = ['sign', 'time', 'app-token', 'user-id', 'x-bc', 'user-agent'];
-let capturedHeaders = {};
-
-chrome.webRequest.onBeforeSendHeaders.addListener(
-  (details) => {
-    if (!details.requestHeaders) return;
-
-    const headers = {};
-    for (const header of details.requestHeaders) {
-      const name = header.name.toLowerCase();
-      if (AUTH_HEADER_NAMES.includes(name)) {
-        headers[name] = header.value;
-      }
-    }
-
-    // Only update if we got meaningful headers (at least user-id)
-    if (headers['user-id']) {
-      capturedHeaders = { ...capturedHeaders, ...headers };
-      console.log('[OF Downloader] Auth headers captured');
-    }
-  },
-  { urls: ['https://onlyfans.com/api2/v2/*'] },
-  ['requestHeaders', 'extraHeaders']
-);
+// background.js - Service worker for download management and duplicate tracking
+// Auth is now handled by the page-context bridge (injected.js) which routes
+// API calls through the page's own fetch(), letting OnlyFans' request
+// interceptors compute the correct per-request `sign` headers automatically.
 
 // ── Download Manager ────────────────────────────────────────────────────────
 
@@ -64,7 +40,6 @@ function executeDownload({ url, filename, mediaId, creator, resolve, reject }) {
           if (delta.state.current === 'complete') {
             chrome.downloads.onChanged.removeListener(listener);
             activeDownloads--;
-            // Record as downloaded
             recordDownload(creator, mediaId);
             resolve({ success: true, mediaId });
             processQueue();
@@ -125,16 +100,11 @@ async function downloadWithRetry(url, filename, mediaId, creator, retries) {
 // ── Message Handler ─────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type === 'GET_AUTH_HEADERS') {
-    sendResponse({ headers: capturedHeaders });
-    return false;
-  }
-
   if (message.type === 'CHECK_DOWNLOADED') {
     isDownloaded(message.creator, message.mediaId).then((result) => {
       sendResponse({ downloaded: result });
     });
-    return true; // async response
+    return true;
   }
 
   if (message.type === 'CHECK_DOWNLOADED_BATCH') {
@@ -148,7 +118,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       sendResponse({ statuses });
     });
-    return true; // async response
+    return true;
   }
 
   if (message.type === 'DOWNLOAD_MEDIA') {

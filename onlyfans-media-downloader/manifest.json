@@ -1,13 +1,12 @@
 {
   "manifest_version": 3,
   "name": "OF Media Downloader",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Download images and videos from OnlyFans creator profiles with duplicate detection.",
   "permissions": [
     "activeTab",
     "downloads",
-    "storage",
-    "webRequest"
+    "storage"
   ],
   "host_permissions": [
     "https://onlyfans.com/*"
@@ -21,6 +20,12 @@
       "js": ["content.js"],
       "css": ["styles.css"],
       "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["injected.js"],
+      "matches": ["https://onlyfans.com/*"]
     }
   ],
   "icons": {
