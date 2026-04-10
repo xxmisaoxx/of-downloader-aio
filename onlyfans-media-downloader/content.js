@@ -1,7 +1,7 @@
-// content.js - UI injection, API pagination, media extraction, download orchestration
-// Uses a page-context bridge (injected.js) for API calls so that OnlyFans'
-// dynamic request interceptors (which compute per-request `sign` headers) are
-// invoked automatically.
+// content.js - UI injection, auto-scroll collection, media extraction, download orchestration
+// Uses a response-interception approach: injected.js patches XHR/fetch to capture
+// OF's own API responses. We auto-scroll the page to trigger OF's infinite scroll,
+// collecting post data as it loads. No custom API calls = no auth issues.
 
 (() => {
   'use strict';
@@ -14,8 +14,12 @@
   let stats = { total: 0, downloaded: 0, skipped: 0, failed: 0 };
   let uiInjected = false;
   let bridgeReady = false;
-  let pendingRequests = new Map(); // id -> { resolve, reject }
-  let requestIdCounter = 0;
+
+  // Collected data from intercepted responses
+  let collectedPosts = [];
+  let collectedPostIds = new Set();
+  let userData = null;
+  let collectingPosts = false;
 
   // ── Page-Context Bridge ─────────────────────────────────────────────────────
 
@@ -32,54 +36,44 @@
     if (event.source !== window) return;
     if (event.data?.channel !== CHANNEL || event.data?.direction !== 'to-content') return;
 
-    const { id, type, payload } = event.data;
+    const { type, payload } = event.data;
 
     if (type === 'BRIDGE_READY') {
       bridgeReady = true;
-      console.log('[OF Downloader] Page-context bridge ready');
+      console.log('[OF Downloader] Response interceptor bridge ready');
       return;
     }
 
-    // Match pending API request
-    const pending = pendingRequests.get(id);
-    if (!pending) return;
+    if (type === 'USER_DATA') {
+      // Capture user data when OF loads it
+      if (payload?.data?.id) {
+        userData = payload.data;
+        console.log('[OF Downloader] Captured user data:', userData.id, userData.username || userData.name);
+      }
+      return;
+    }
 
-    if (type === 'API_FETCH_SUCCESS') {
-      pendingRequests.delete(id);
-      pending.resolve(payload);
-    } else if (type === 'API_FETCH_ERROR') {
-      pendingRequests.delete(id);
-      pending.reject(new Error(`API error ${payload.status}: ${payload.statusText}`));
+    if (type === 'POSTS_DATA' && collectingPosts) {
+      // Capture post data as OF's infinite scroll loads it
+      const data = payload?.data;
+      if (data && Array.isArray(data.list)) {
+        let newCount = 0;
+        for (const post of data.list) {
+          const postId = String(post.id);
+          if (!collectedPostIds.has(postId)) {
+            collectedPostIds.add(postId);
+            collectedPosts.push(post);
+            newCount++;
+          }
+        }
+        if (newCount > 0) {
+          console.log(`[OF Downloader] Captured ${newCount} new posts (total: ${collectedPosts.length})`);
+          updateStatus(`Scrolling... captured ${collectedPosts.length} posts`);
+        }
+      }
+      return;
     }
   });
-
-  function apiFetchViaBridge(url) {
-    return new Promise((resolve, reject) => {
-      if (!bridgeReady) {
-        reject(new Error('Page bridge not ready. Please reload the page and try again.'));
-        return;
-      }
-
-      const id = String(++requestIdCounter);
-      pendingRequests.set(id, { resolve, reject });
-
-      window.postMessage({
-        channel: CHANNEL,
-        direction: 'to-page',
-        id,
-        type: 'API_FETCH',
-        payload: { url },
-      }, '*');
-
-      // Timeout after 30 seconds
-      setTimeout(() => {
-        if (pendingRequests.has(id)) {
-          pendingRequests.delete(id);
-          reject(new Error('API request timed out'));
-        }
-      }, 30000);
-    });
-  }
 
   // ── Utility ─────────────────────────────────────────────────────────────────
 
@@ -118,69 +112,61 @@
     });
   }
 
-  // ── OF API Calls (via page bridge) ─────────────────────────────────────────
+  // ── Auto-Scroll to Load All Posts ──────────────────────────────────────────
 
-  async function resolveUserId(username) {
-    const url = `https://onlyfans.com/api2/v2/users/${encodeURIComponent(username)}`;
-    const data = await apiFetchViaBridge(url);
-    if (!data?.id) {
-      throw new Error(`Could not resolve user ID for "${username}". Make sure you're subscribed to this creator.`);
-    }
-    return data.id;
-  }
+  async function scrollToCollectAllPosts() {
+    collectedPosts = [];
+    collectedPostIds.clear();
+    collectingPosts = true;
 
-  async function fetchAllPosts(userId) {
-    const allPosts = [];
-    let beforePublishTime = '';
-    let hasMore = true;
-    let page = 0;
+    const scrollContainer = document.scrollingElement || document.documentElement;
+    let lastPostCount = 0;
+    let staleRounds = 0;
+    const MAX_STALE_ROUNDS = 8; // Stop after 8 scroll attempts with no new posts
 
-    while (hasMore && !isCancelled) {
-      let endpoint = `https://onlyfans.com/api2/v2/users/${userId}/posts?limit=50&order=publish_date_desc&skip_users=all&format=infinite`;
-      if (beforePublishTime) {
-        endpoint += `&beforePublishTime=${beforePublishTime}`;
-      }
+    updateStatus('Scrolling to load all posts...');
 
-      let data;
-      try {
-        data = await apiFetchViaBridge(endpoint);
-      } catch (err) {
-        // If we get an error after already collecting some posts, just stop
-        if (allPosts.length > 0) {
-          console.warn('[OF Downloader] Pagination error, stopping:', err.message);
+    // First, scroll to top to start from the beginning
+    window.scrollTo(0, 0);
+    await sleep(1000);
+
+    while (!isCancelled) {
+      const prevHeight = scrollContainer.scrollHeight;
+
+      // Scroll to bottom
+      window.scrollTo(0, scrollContainer.scrollHeight);
+      await sleep(1500);
+
+      const newHeight = scrollContainer.scrollHeight;
+      const currentPostCount = collectedPosts.length;
+
+      updateStatus(`Scrolling... captured ${currentPostCount} posts`);
+
+      // Check if we got new posts
+      if (currentPostCount === lastPostCount) {
+        staleRounds++;
+        if (staleRounds >= MAX_STALE_ROUNDS) {
+          // No new posts after multiple scrolls — we've reached the end
+          console.log('[OF Downloader] Reached end of posts (no new data after scrolling)');
           break;
         }
-        throw err;
-      }
-
-      if (!data || !Array.isArray(data.list) || data.list.length === 0) {
-        hasMore = false;
-        break;
-      }
-
-      allPosts.push(...data.list);
-      page++;
-      updateStatus(`Scanning posts... found ${allPosts.length} so far (page ${page})`);
-
-      // Use the last post's timestamp as cursor
-      const lastPost = data.list[data.list.length - 1];
-      if (lastPost?.postedAtPrecise) {
-        beforePublishTime = lastPost.postedAtPrecise;
-      } else if (lastPost?.publishedAt) {
-        beforePublishTime = lastPost.publishedAt;
+        // If page height didn't change either, likely at the bottom
+        if (newHeight === prevHeight && staleRounds >= 3) {
+          console.log('[OF Downloader] Page height stable + no new posts — done');
+          break;
+        }
       } else {
-        hasMore = false;
+        staleRounds = 0;
+        lastPostCount = currentPostCount;
       }
-
-      if (data.hasMore === false || data.list.length < 50) {
-        hasMore = false;
-      }
-
-      // Rate limit API calls
-      await sleep(500);
     }
 
-    return allPosts;
+    collectingPosts = false;
+
+    // Scroll back to top
+    window.scrollTo(0, 0);
+
+    return collectedPosts;
   }
 
   // ── Media Extraction ────────────────────────────────────────────────────────
@@ -193,7 +179,6 @@
       if (!post.media || !Array.isArray(post.media)) continue;
 
       for (const media of post.media) {
-        // Deduplicate by media ID
         const mediaId = String(media.id);
         if (seenIds.has(mediaId)) continue;
         seenIds.add(mediaId);
@@ -208,7 +193,6 @@
             filename: `${media.id}.${ext}`,
           });
         } else if (media.type === 'video') {
-          // Try to get highest quality source
           const url =
             media.source?.source ||
             media.files?.source?.url ||
@@ -261,30 +245,33 @@
 
     setButtonState('running');
     updateProgress(0);
-    updateStatus('Connecting to OnlyFans API...');
 
     try {
       if (!bridgeReady) {
-        throw new Error('Page bridge not ready. Please reload the page and try again.');
+        throw new Error('Response interceptor not ready. Please reload the page and try again.');
       }
 
-      updateStatus(`Resolving user ID for ${creator}...`);
-      const userId = await resolveUserId(creator);
-
-      updateStatus('Scanning posts...');
-      const posts = await fetchAllPosts(userId);
+      // Phase 1: Auto-scroll to collect all posts
+      updateStatus('Phase 1: Scrolling to load all posts...');
+      const posts = await scrollToCollectAllPosts();
 
       if (isCancelled) {
         finish('Cancelled');
         return;
       }
 
-      updateStatus('Extracting media URLs...');
+      if (posts.length === 0) {
+        finish('No posts captured. Try scrolling the page manually first, then click Download again.');
+        return;
+      }
+
+      // Phase 2: Extract media
+      updateStatus(`Phase 2: Extracting media from ${posts.length} posts...`);
       const mediaItems = extractMedia(posts);
       stats.total = mediaItems.length;
 
       if (mediaItems.length === 0) {
-        finish('No media found.');
+        finish(`Found ${posts.length} posts but no downloadable media.`);
         return;
       }
 
@@ -299,7 +286,9 @@
       });
       const dupStatuses = dupResponse?.statuses || {};
 
-      // Download each item
+      // Phase 3: Download
+      updateStatus(`Phase 3: Downloading ${mediaItems.length} files...`);
+
       for (let i = 0; i < mediaItems.length; i++) {
         if (isCancelled) {
           finish('Cancelled');
@@ -308,7 +297,6 @@
 
         const media = mediaItems[i];
 
-        // Skip duplicates
         if (dupStatuses[media.id]) {
           stats.skipped++;
           updateUI();
@@ -350,10 +338,12 @@
 
   function cancelDownload() {
     isCancelled = true;
+    collectingPosts = false;
   }
 
   function finish(reason) {
     isRunning = false;
+    collectingPosts = false;
     setButtonState('idle');
     const msg =
       reason === 'Complete'
@@ -362,7 +352,9 @@
           ? `Cancelled. ${stats.downloaded} downloaded, ${stats.skipped} skipped so far.`
           : reason;
     updateStatus(msg);
-    updateProgress(100);
+    if (reason === 'Complete' || reason === 'Cancelled') {
+      updateProgress(100);
+    }
   }
 
   function updateUI() {
@@ -476,7 +468,6 @@
   const observer = new MutationObserver(() => {
     if (location.href !== lastURL) {
       lastURL = location.href;
-      // Reset state on navigation
       if (isRunning) {
         cancelDownload();
       }
@@ -488,9 +479,6 @@
 
   // ── Init ────────────────────────────────────────────────────────────────────
 
-  // Inject the page-context bridge script
   injectPageScript();
-
-  // Initial page check
   checkPage();
 })();
