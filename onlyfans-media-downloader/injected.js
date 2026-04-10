@@ -9,6 +9,7 @@
 
   const CHANNEL = 'of-dl';
   const POST_URL_PATTERN = /\/api2\/v2\/users\/\d+\/posts/;
+  const MEDIA_URL_PATTERN = /\/api2\/v2\/users\/\d+\/medias/;
   const USER_URL_PATTERN = /\/api2\/v2\/users\/([a-zA-Z0-9._-]+)$/;
 
   function notify(type, payload) {
@@ -47,6 +48,19 @@
       });
     }
 
+    if (MEDIA_URL_PATTERN.test(url)) {
+      this.addEventListener('load', function () {
+        try {
+          if (this.status >= 200 && this.status < 300) {
+            const data = JSON.parse(this.responseText);
+            notify('MEDIAS_DATA', { url, data });
+          }
+        } catch (e) {
+          // ignore parse errors
+        }
+      });
+    }
+
     if (USER_URL_PATTERN.test(url)) {
       this.addEventListener('load', function () {
         try {
@@ -76,10 +90,18 @@
 
     if (POST_URL_PATTERN.test(url)) {
       promise.then((response) => {
-        // Clone so the original consumer still works
         const clone = response.clone();
         clone.json().then((data) => {
           notify('POSTS_DATA', { url, data });
+        }).catch(() => {});
+      }).catch(() => {});
+    }
+
+    if (MEDIA_URL_PATTERN.test(url)) {
+      promise.then((response) => {
+        const clone = response.clone();
+        clone.json().then((data) => {
+          notify('MEDIAS_DATA', { url, data });
         }).catch(() => {});
       }).catch(() => {});
     }

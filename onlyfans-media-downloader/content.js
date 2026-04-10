@@ -18,6 +18,8 @@
   // Collected data from intercepted responses
   let collectedPosts = [];
   let collectedPostIds = new Set();
+  let collectedMediaItems = []; // Direct media items from /medias endpoint
+  let collectedMediaIds = new Set();
   let userData = null;
   let collectingPosts = false;
 
@@ -68,8 +70,29 @@
         }
         if (newCount > 0) {
           console.log(`[OF Downloader] Captured ${newCount} new posts (total: ${collectedPosts.length})`);
-          updateStatus(`Scrolling... captured ${collectedPosts.length} posts`);
+          updateStatus(`Scrolling... captured ${collectedPosts.length} posts, ${collectedMediaItems.length} media items`);
         }
+      }
+      return;
+    }
+
+    if (type === 'MEDIAS_DATA' && collectingPosts) {
+      // Capture media items from /medias endpoint (media tab)
+      // The response can be { list: [...] } or a direct array
+      const data = payload?.data;
+      const items = Array.isArray(data) ? data : (data?.list || []);
+      let newCount = 0;
+      for (const media of items) {
+        const mediaId = String(media.id);
+        if (!collectedMediaIds.has(mediaId)) {
+          collectedMediaIds.add(mediaId);
+          collectedMediaItems.push(media);
+          newCount++;
+        }
+      }
+      if (newCount > 0) {
+        console.log(`[OF Downloader] Captured ${newCount} new media items (total: ${collectedMediaItems.length})`);
+        updateStatus(`Scrolling... captured ${collectedPosts.length} posts, ${collectedMediaItems.length} media items`);
       }
       return;
     }
@@ -85,11 +108,16 @@
       'login', 'signup', 'api', 'api2', 'terms', 'privacy',
       'dmca', 'compliance', 'refund', 'developers', 'about',
     ];
-    const match = path.match(/^\/([a-zA-Z0-9._-]+)\/?$/);
+    // Match /username, /username/media, /username/photos, /username/videos, etc.
+    const match = path.match(/^\/([a-zA-Z0-9._-]+)(?:\/(media|photos|videos))?\/?$/);
     if (match && !systemPaths.includes(match[1].toLowerCase())) {
       return match[1];
     }
     return null;
+  }
+
+  function isMediaPage() {
+    return /^\/[a-zA-Z0-9._-]+\/(media|photos|videos)\/?$/.test(window.location.pathname);
   }
 
   function sleep(ms) {
@@ -114,106 +142,119 @@
 
   // ── Auto-Scroll to Load All Posts ──────────────────────────────────────────
 
-  async function scrollToCollectAllPosts() {
+  async function scrollToCollectAll() {
     collectedPosts = [];
     collectedPostIds.clear();
+    collectedMediaItems = [];
+    collectedMediaIds.clear();
     collectingPosts = true;
 
     const scrollContainer = document.scrollingElement || document.documentElement;
-    let lastPostCount = 0;
+    let lastItemCount = 0;
     let staleRounds = 0;
-    const MAX_STALE_ROUNDS = 8; // Stop after 8 scroll attempts with no new posts
+    const MAX_STALE_ROUNDS = 8;
 
-    updateStatus('Scrolling to load all posts...');
+    const onMedia = isMediaPage();
+    updateStatus(`Scrolling to load all ${onMedia ? 'media' : 'posts'}...`);
 
-    // First, scroll to top to start from the beginning
+    // Scroll to top first
     window.scrollTo(0, 0);
     await sleep(1000);
 
     while (!isCancelled) {
       const prevHeight = scrollContainer.scrollHeight;
 
-      // Scroll to bottom
       window.scrollTo(0, scrollContainer.scrollHeight);
       await sleep(1500);
 
       const newHeight = scrollContainer.scrollHeight;
-      const currentPostCount = collectedPosts.length;
+      // Count both posts and direct media items
+      const currentItemCount = collectedPosts.length + collectedMediaItems.length;
 
-      updateStatus(`Scrolling... captured ${currentPostCount} posts`);
+      const statusParts = [];
+      if (collectedPosts.length > 0) statusParts.push(`${collectedPosts.length} posts`);
+      if (collectedMediaItems.length > 0) statusParts.push(`${collectedMediaItems.length} media items`);
+      updateStatus(`Scrolling... captured ${statusParts.join(', ') || '0 items'}`);
 
-      // Check if we got new posts
-      if (currentPostCount === lastPostCount) {
+      if (currentItemCount === lastItemCount) {
         staleRounds++;
         if (staleRounds >= MAX_STALE_ROUNDS) {
-          // No new posts after multiple scrolls — we've reached the end
-          console.log('[OF Downloader] Reached end of posts (no new data after scrolling)');
+          console.log('[OF Downloader] Reached end (no new data after scrolling)');
           break;
         }
-        // If page height didn't change either, likely at the bottom
         if (newHeight === prevHeight && staleRounds >= 3) {
-          console.log('[OF Downloader] Page height stable + no new posts — done');
+          console.log('[OF Downloader] Page height stable + no new items — done');
           break;
         }
       } else {
         staleRounds = 0;
-        lastPostCount = currentPostCount;
+        lastItemCount = currentItemCount;
       }
     }
 
     collectingPosts = false;
-
-    // Scroll back to top
     window.scrollTo(0, 0);
-
-    return collectedPosts;
   }
 
   // ── Media Extraction ────────────────────────────────────────────────────────
 
-  function extractMedia(posts) {
-    const mediaItems = [];
+  function extractMediaFromItem(media, seenIds, results) {
+    const mediaId = String(media.id);
+    if (seenIds.has(mediaId)) return;
+    seenIds.add(mediaId);
+
+    if (media.type === 'photo') {
+      const url = media.full || media.src || media.preview || null;
+      if (url) {
+        const ext = getExtension(url, 'jpg');
+        results.push({
+          id: mediaId,
+          url: url,
+          type: 'photo',
+          filename: `${media.id}.${ext}`,
+        });
+      }
+    } else if (media.type === 'video' || media.type === 'gif') {
+      const url =
+        media.source?.source ||
+        media.files?.source?.url ||
+        media.videoSources?.['720']?.url ||
+        media.full ||
+        media.src ||
+        media.preview ||
+        null;
+
+      if (url) {
+        const ext = getExtension(url, 'mp4');
+        results.push({
+          id: mediaId,
+          url: url,
+          type: 'video',
+          filename: `${media.id}.${ext}`,
+        });
+      }
+    }
+  }
+
+  function extractAllMedia() {
+    const results = [];
     const seenIds = new Set();
 
-    for (const post of posts) {
+    // Extract from posts (each post has a .media array)
+    for (const post of collectedPosts) {
       if (!post.media || !Array.isArray(post.media)) continue;
-
       for (const media of post.media) {
-        const mediaId = String(media.id);
-        if (seenIds.has(mediaId)) continue;
-        seenIds.add(mediaId);
-
-        if (media.type === 'photo' && media.full) {
-          const url = media.full;
-          const ext = getExtension(url, 'jpg');
-          mediaItems.push({
-            id: mediaId,
-            url: url,
-            type: 'photo',
-            filename: `${media.id}.${ext}`,
-          });
-        } else if (media.type === 'video') {
-          const url =
-            media.source?.source ||
-            media.files?.source?.url ||
-            media.videoSources?.['720']?.url ||
-            media.full ||
-            null;
-
-          if (url) {
-            const ext = getExtension(url, 'mp4');
-            mediaItems.push({
-              id: mediaId,
-              url: url,
-              type: 'video',
-              filename: `${media.id}.${ext}`,
-            });
-          }
-        }
+        extractMediaFromItem(media, seenIds, results);
       }
     }
 
-    return mediaItems;
+    // Extract from direct media items (/medias endpoint)
+    // These are top-level media objects, not nested inside posts
+    for (const media of collectedMediaItems) {
+      extractMediaFromItem(media, seenIds, results);
+    }
+
+    return results;
   }
 
   function getExtension(url, fallback) {
@@ -251,27 +292,32 @@
         throw new Error('Response interceptor not ready. Please reload the page and try again.');
       }
 
-      // Phase 1: Auto-scroll to collect all posts
-      updateStatus('Phase 1: Scrolling to load all posts...');
-      const posts = await scrollToCollectAllPosts();
+      // Phase 1: Auto-scroll to collect all data
+      const onMedia = isMediaPage();
+      updateStatus(`Phase 1: Scrolling to load all ${onMedia ? 'media' : 'posts'}...`);
+      await scrollToCollectAll();
 
       if (isCancelled) {
         finish('Cancelled');
         return;
       }
 
-      if (posts.length === 0) {
-        finish('No posts captured. Try scrolling the page manually first, then click Download again.');
+      const totalCaptured = collectedPosts.length + collectedMediaItems.length;
+      if (totalCaptured === 0) {
+        finish('No data captured. Navigate to the creator\'s Media tab and try again.');
         return;
       }
 
       // Phase 2: Extract media
-      updateStatus(`Phase 2: Extracting media from ${posts.length} posts...`);
-      const mediaItems = extractMedia(posts);
+      const sourceSummary = [];
+      if (collectedPosts.length > 0) sourceSummary.push(`${collectedPosts.length} posts`);
+      if (collectedMediaItems.length > 0) sourceSummary.push(`${collectedMediaItems.length} media items`);
+      updateStatus(`Phase 2: Extracting media from ${sourceSummary.join(' + ')}...`);
+      const mediaItems = extractAllMedia();
       stats.total = mediaItems.length;
 
       if (mediaItems.length === 0) {
-        finish(`Found ${posts.length} posts but no downloadable media.`);
+        finish(`Captured ${sourceSummary.join(' + ')} but no downloadable media URLs found.`);
         return;
       }
 
